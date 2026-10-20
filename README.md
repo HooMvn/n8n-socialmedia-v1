@@ -399,8 +399,8 @@ Provider را بدون Live Smoke برای مشتری Production-ready اعلا�
 # 🚀 اجرای Local
 
 ```bash
-git clone https://github.com/mahamirmh/n8n-socialmedia-platform.git
-cd n8n-socialmedia-platform
+git clone https://github.com/HooMvn/n8n-socialmedia-v1.git
+cd n8n-socialmedia-v1
 cp .env.example .env
 docker compose up --build
 ```

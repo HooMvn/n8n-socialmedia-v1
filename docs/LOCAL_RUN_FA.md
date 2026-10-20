@@ -12,8 +12,8 @@
 ## 1. دریافت پروژه
 
 ```bash
-git clone https://github.com/mahamirmh/n8n-socialmedia-platform.git
-cd n8n-socialmedia-platform
+git clone https://github.com/HooMvn/n8n-socialmedia-v1.git
+cd n8n-socialmedia-v1
 ```
 
 ## 2. Environment
