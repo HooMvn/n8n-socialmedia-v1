@@ -1,0 +1,1220 @@
+{
+  "name": "ENGAGE__PRODUCT__PIPELINE__V1",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "risheh-product",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "96390b5c-3c76-4a5a-88f1-0265a623a597",
+      "name": "Product Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "risheh-product"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Single entry webhook for all product.* outbox events (see app/outbox_worker.py).\nconst secret = $json.headers?.['x-automation-secret'];\nif (!secret || secret !== $env.RISHEH_AUTOMATION_SECRET) throw new Error('invalid automation secret');\nconst e = $json.body ?? $json;\nconst allowed = ['product.content.generate.requested', 'product.wordpress.publish.requested', 'product.notify.fanout.requested'];\nif (!allowed.includes(e.event_type)) throw new Error('unsupported event type: ' + e.event_type);\nif (!e.payload) throw new Error('missing payload');\nreturn [{ json: {\n  event_type: e.event_type,\n  event_id: e.event_id,\n  workspace_id: e.workspace_id ?? e.payload.workspace_id,\n  correlation_id: e.correlation_id ?? null,\n  payload: e.payload\n} }];"
+      },
+      "id": "07799dba-54a5-4df9-8ff5-9ddb6e03d37c",
+      "name": "Validate Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.event_type }}",
+                    "rightValue": "product.content.generate.requested",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "generate"
+            },
+            {
+              "conditions": {
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.event_type }}",
+                    "rightValue": "product.wordpress.publish.requested",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "wordpress"
+            },
+            {
+              "conditions": {
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.event_type }}",
+                    "rightValue": "product.notify.fanout.requested",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "notify"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "d9aa630b-11b9-4a69-87f4-4c9b34876e2d",
+      "name": "Route Event",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "throw new Error('unrouted event type: ' + ($json.event_type ?? 'unknown'));"
+      },
+      "id": "bbe7e513-a5e8-438a-a6fa-cb4be51ee5c0",
+      "name": "Unknown Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        780
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.RISHEH_API_BASE_URL }}/api/v1/workspaces/{{ $json.workspace_id }}/products/jobs/{{ $json.payload.job_id }}/generate-draft",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-automation-secret",
+              "value": "={{ $env.RISHEH_AUTOMATION_SECRET }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ instruction: $json.payload.instruction ?? 'این محصول را به‌صورت یک پست وبلاگ فارسی، صادقانه و فقط بر اساس داده ارائه‌شده معرفی کن.' }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "c47cd44b-e4da-481d-88e0-8c74b10efb25",
+      "name": "Generate Draft (API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        40
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body ?? $json;\nif (body.detail && !body.job) {\n  // 4xx/5xx handled by API state machine already (job -> failed/needs_attention). Log & accept.\n  return [{ json: { job_status: null, error: JSON.stringify(body.detail).slice(0, 500) } }];\n}\nreturn [{ json: { job_status: body.job?.status ?? null, version_id: body.version?.id ?? null, auto_publish: body.auto_publish ?? false } }];"
+      },
+      "id": "b40eb4e2-1185-4185-8a0b-88ed2896c27e",
+      "name": "Check Generate Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, stage: 'generate', job_status: $json.job_status, error: $json.error ?? null }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "14389de3-1e18-438e-9816-a1a9f6b5d975",
+      "name": "Accepted (Generate)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $json.payload;\n// Minimal Markdown -> HTML conversion (headings, bold, italic, lists, links).\nlet md = String(p.body_markdown ?? '');\nmd = md.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');\nmd = md.replace(/^###\\s+(.+)$/gm, '<h3>$1</h3>')\n       .replace(/^##\\s+(.+)$/gm, '<h2>$1</h2>')\n       .replace(/^#\\s+(.+)$/gm, '<h1>$1</h1>')\n       .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')\n       .replace(/\\*(.+?)\\*/g, '<em>$1</em>')\n       .replace(/^-\\s+(.+)$/gm, '<li>$1</li>')\n       .replace(/((?:<li>.*<\\/li>\\s*)+)/g, m => '<ul>' + m.trim() + '</ul>')\n       .replace(/\\[(.*?)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href=\"$2\">$1</a>');\nmd = md.split(/\\n{2,}/).map(b => /^<(h\\d|ul|ol|p|blockquote)/.test(b.trim()) ? b : ('<p>' + b.replace(/\\n/g,'<br />') + '</p>')).join('\\n');\nreturn [{ json: {\n  publication_id: p.publication_id,\n  content_id: p.content_id,\n  job_id: p.job_id,\n  workspace_id: p.workspace_id,\n  idempotency_key: p.idempotency_key,\n  title: p.title ?? 'محصول جدید',\n  body_html: md,\n  excerpt: p.excerpt ?? '',\n  status: $env.RISHEH_WP_POST_STATUS ?? 'publish',\n  image: p.image ?? ''\n} }];"
+      },
+      "id": "7b36b7f8-5081-427e-9465-dd219331d389",
+      "name": "Prepare WP Post",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.image }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "618b160a-d2f6-4d54-a352-662d5cb55c45",
+      "name": "Has Featured Image?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        900,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.image }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "120d3a54-44c9-4a27-a0e5-8dd71b4d5804",
+      "name": "Download Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        140
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORDPRESS_SITE_URL }}/wp-json/wp/v2/media",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "wordPressApi",
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataType": "binary",
+        "binaryPropertyName": "data",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "40200ae2-cf0e-41b9-9d84-6ef1d00390c9",
+      "name": "WP Media New",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        140
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Prepare WP Post').first().json;\nconst out = { ...base };\ndelete out.image;\ntry {\n  const mediaItems = $items('WP Media New');\n  const m = mediaItems && mediaItems.length ? mediaItems[mediaItems.length - 1].json : null;\n  if (m && m.id) out.featured_media = m.id;\n} catch (e) { /* image upload skipped */ }\nreturn [{ json: out }];"
+      },
+      "id": "16445f57-52ff-4d17-88af-5349ddabc111",
+      "name": "Merge Post Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORDPRESS_SITE_URL }}/wp-json/wp/v2/posts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "wordPressApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "context",
+              "value": "view"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ title: $json.title, content: $json.body_html, excerpt: $json.excerpt, status: $json.status, featured_media: $json.featured_media }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "3d3b549c-4cf0-4093-8ae3-1627efd576f1",
+      "name": "WP Create Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1780,
+        220
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.RISHEH_API_BASE_URL }}/api/v1/automation/products/publish-callback",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-automation-secret",
+              "value": "={{ $env.RISHEH_AUTOMATION_SECRET }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ publication_id: $('Prepare WP Post').first().json.publication_id, idempotency_key: $('Prepare WP Post').first().json.idempotency_key, status: 'published', external_id: String($json.id ?? ''), external_url: $json.link ?? '' }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "eda7a3be-c533-4f47-a543-dca991ef5060",
+      "name": "Publish Callback (OK)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, stage: 'wordpress', post_id: $json.external_id }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "8ce05a48-dbe5-4901-9321-65f89160efa9",
+      "name": "Accepted (WordPress)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2220,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.RISHEH_API_BASE_URL }}/api/v1/automation/products/publish-callback",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-automation-secret",
+              "value": "={{ $env.RISHEH_AUTOMATION_SECRET }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ publication_id: $('Prepare WP Post').first().json.publication_id, idempotency_key: $('Prepare WP Post').first().json.idempotency_key, status: 'failed', error_code: 'wp_publish_failed', error_message: String($json.message ?? $json.error ?? 'wordpress publish failed').slice(0, 1000) }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "5289ecd6-adb9-48b9-964b-57280dff4664",
+      "name": "Publish Callback (Failed)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, stage: 'wordpress', reported: true }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "f0aad2d7-b93e-49b7-b890-4e69d54e43d8",
+      "name": "Accepted (WP Failed)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2220,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $json.payload;\nif (!Array.isArray(p.targets) || p.targets.length === 0) {\n  return [{ json: { notification_id: p.notification_id, idempotency_key: p.idempotency_key, channel: null, empty: true } }];\n}\nreturn p.targets.map(t => ({ json: {\n  notification_id: p.notification_id,\n  idempotency_key: p.idempotency_key,\n  channel: t.channel,\n  target_ref: t.target_ref,\n  template_key: t.template_key ?? null,\n  message: p.message,\n  links: p.links ?? {},\n  empty: false\n}}));"
+      },
+      "id": "8dbb5525-c46c-4461-82b9-4de00f6a6b2a",
+      "name": "Split Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "telegram",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "telegram"
+            },
+            {
+              "conditions": {
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "ble",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "ble"
+            },
+            {
+              "conditions": {
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "rubika",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "rubika"
+            },
+            {
+              "conditions": {
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "whatsapp",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "whatsapp"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "ffbf91f8-fd2e-410d-8c1b-005c5ce99be7",
+      "name": "Channel Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        900,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Split Targets').first().json;\nreturn [{ json: { __ack: {\n  notification_id: base.notification_id,\n  idempotency_key: base.idempotency_key,\n  channel: String($json.channel ?? 'unknown').slice(0, 40),\n  target_ref: String($json.target_ref ?? 'n/a').slice(0, 255),\n  delivered: false,\n  error_code: 'channel_not_supported',\n  error_message: 'no adapter configured for this channel in the workflow'\n} } }];"
+      },
+      "id": "3915e916-c0fd-4d62-b4c7-322178591b91",
+      "name": "Unsupported Channel Ack",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.target_ref, text: $json.message, parse_mode: 'HTML', disable_web_page_preview: false }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "aa71762c-b6a0-4027-a44e-a2da59365bb2",
+      "name": "Telegram Send",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        340
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://tapi.bale.ai/bot{{ $env.BALE_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.target_ref, text: $json.message, parse_mode: 'HTML', disable_web_page_preview: false }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "cfe81852-0dbd-43c1-a923-6757f4e66072",
+      "name": "Bale Send",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        480
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://bot.rubika.ir:555/v2/sendText",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.RUBIKA_BOT_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.target_ref, text: $json.message }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "3e00f42a-d851-4b71-8974-b26b3e036c97",
+      "name": "Rubika Send",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        620
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WHATSAPP_GRAPH_BASE_URL || 'https://graph.facebook.com/v20.0' }}/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messaging_product: 'whatsapp', to: $json.target_ref, type: 'text', text: { preview_url: true, body: $json.message } }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "84cd4817-9427-4e65-8007-ff7b466759ed",
+      "name": "WhatsApp Send (Cloud API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        760
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json ?? {};\nconst base = $('Split Targets').first().json;\nlet extId = null;\ntry { extId = src.result?.message_id ?? null; } catch (e) {}\nconst ok = Boolean(extId);\nreturn [{ json: { __ack: {\n  notification_id: base.notification_id,\n  idempotency_key: base.idempotency_key,\n  channel: 'telegram',\n  target_ref: base.target_ref,\n  delivered: ok,\n  external_message_id: ok ? String(extId) : null,\n  error_code: ok ? null : 'delivery_failed',\n  error_message: ok ? null : String(src.message ?? src.lastErr ?? src.error ?? 'provider did not confirm delivery').slice(0, 1000)\n} } }]];"
+      },
+      "id": "7a14f29b-1781-463f-9eec-cac876f0e4cc",
+      "name": "Telegram Ack",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json ?? {};\nconst base = $('Split Targets').first().json;\nlet extId = null;\ntry { extId = null ?? null; } catch (e) {}\nconst ok = Boolean(extId);\nreturn [{ json: { __ack: {\n  notification_id: base.notification_id,\n  idempotency_key: base.idempotency_key,\n  channel: 'telegram',\n  target_ref: base.target_ref,\n  delivered: ok,\n  external_message_id: ok ? String(extId) : null,\n  error_code: ok ? null : 'delivery_failed',\n  error_message: ok ? null : String(src.message ?? src.lastErr ?? src.error ?? 'provider did not confirm delivery').slice(0, 1000)\n} } }]];"
+      },
+      "id": "74d75aa4-a41a-480f-bbcc-461ca51325c2",
+      "name": "Telegram ErrAck",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json ?? {};\nconst base = $('Split Targets').first().json;\nlet extId = null;\ntry { extId = src.result?.message_id ?? null; } catch (e) {}\nconst ok = Boolean(extId);\nreturn [{ json: { __ack: {\n  notification_id: base.notification_id,\n  idempotency_key: base.idempotency_key,\n  channel: 'ble',\n  target_ref: base.target_ref,\n  delivered: ok,\n  external_message_id: ok ? String(extId) : null,\n  error_code: ok ? null : 'delivery_failed',\n  error_message: ok ? null : String(src.message ?? src.lastErr ?? src.error ?? 'provider did not confirm delivery').slice(0, 1000)\n} } }]];"
+      },
+      "id": "633e99ef-e78c-4a84-b976-4a5c4227b290",
+      "name": "Bale Ack",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json ?? {};\nconst base = $('Split Targets').first().json;\nlet extId = null;\ntry { extId = null ?? null; } catch (e) {}\nconst ok = Boolean(extId);\nreturn [{ json: { __ack: {\n  notification_id: base.notification_id,\n  idempotency_key: base.idempotency_key,\n  channel: 'ble',\n  target_ref: base.target_ref,\n  delivered: ok,\n  external_message_id: ok ? String(extId) : null,\n  error_code: ok ? null : 'delivery_failed',\n  error_message: ok ? null : String(src.message ?? src.lastErr ?? src.error ?? 'provider did not confirm delivery').slice(0, 1000)\n} } }]];"
+      },
+      "id": "9d9fcf33-6ee1-4699-8c03-7f93691d1327",
+      "name": "Bale ErrAck",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json ?? {};\nconst base = $('Split Targets').first().json;\nlet extId = null;\ntry { extId = src.message_id ?? src.id ?? null; } catch (e) {}\nconst ok = Boolean(extId);\nreturn [{ json: { __ack: {\n  notification_id: base.notification_id,\n  idempotency_key: base.idempotency_key,\n  channel: 'rubika',\n  target_ref: base.target_ref,\n  delivered: ok,\n  external_message_id: ok ? String(extId) : null,\n  error_code: ok ? null : 'delivery_failed',\n  error_message: ok ? null : String(src.message ?? src.lastErr ?? src.error ?? 'provider did not confirm delivery').slice(0, 1000)\n} } }]];"
+      },
+      "id": "c84d809e-364b-4a0a-b179-b74147c1e8c4",
+      "name": "Rubika Ack",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        580
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json ?? {};\nconst base = $('Split Targets').first().json;\nlet extId = null;\ntry { extId = null ?? null; } catch (e) {}\nconst ok = Boolean(extId);\nreturn [{ json: { __ack: {\n  notification_id: base.notification_id,\n  idempotency_key: base.idempotency_key,\n  channel: 'rubika',\n  target_ref: base.target_ref,\n  delivered: ok,\n  external_message_id: ok ? String(extId) : null,\n  error_code: ok ? null : 'delivery_failed',\n  error_message: ok ? null : String(src.message ?? src.lastErr ?? src.error ?? 'provider did not confirm delivery').slice(0, 1000)\n} } }]];"
+      },
+      "id": "63e82b2d-bdb8-4ac3-92fe-a561e714542d",
+      "name": "Rubika ErrAck",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json ?? {};\nconst base = $('Split Targets').first().json;\nlet extId = null;\ntry { extId = src.messages?.[0]?.id ?? null; } catch (e) {}\nconst ok = Boolean(extId);\nreturn [{ json: { __ack: {\n  notification_id: base.notification_id,\n  idempotency_key: base.idempotency_key,\n  channel: 'whatsapp',\n  target_ref: base.target_ref,\n  delivered: ok,\n  external_message_id: ok ? String(extId) : null,\n  error_code: ok ? null : 'delivery_failed',\n  error_message: ok ? null : String(src.message ?? src.lastErr ?? src.error ?? 'provider did not confirm delivery').slice(0, 1000)\n} } }]];"
+      },
+      "id": "30702eb3-40c2-4ae4-9f21-2a1e3ec3a8f5",
+      "name": "WhatsApp Ack",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json ?? {};\nconst base = $('Split Targets').first().json;\nlet extId = null;\ntry { extId = null ?? null; } catch (e) {}\nconst ok = Boolean(extId);\nreturn [{ json: { __ack: {\n  notification_id: base.notification_id,\n  idempotency_key: base.idempotency_key,\n  channel: 'whatsapp',\n  target_ref: base.target_ref,\n  delivered: ok,\n  external_message_id: ok ? String(extId) : null,\n  error_code: ok ? null : 'delivery_failed',\n  error_message: ok ? null : String(src.message ?? src.lastErr ?? src.error ?? 'provider did not confirm delivery').slice(0, 1000)\n} } }]];"
+      },
+      "id": "da393bb1-e95f-47fc-88af-38655f3969cb",
+      "name": "WhatsApp ErrAck",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.RISHEH_API_BASE_URL }}/api/v1/automation/products/notify-ack",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-automation-secret",
+              "value": "={{ $env.RISHEH_AUTOMATION_SECRET }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.__ack) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "c6107fd3-2ee1-4f46-9193-0f8ccb55ed4c",
+      "name": "Notify Ack (API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1640,
+        520
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, stage: 'notify', acked: true }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "9367425e-901c-472e-845b-8e0799a063c2",
+      "name": "Accepted (Notify)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1860,
+        520
+      ]
+    }
+  ],
+  "connections": {
+    "Product Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Event": {
+      "main": [
+        [
+          {
+            "node": "Route Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Event": {
+      "main": [
+        [
+          {
+            "node": "Generate Draft (API)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare WP Post",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Split Targets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unknown Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Draft (API)": {
+      "main": [
+        [
+          {
+            "node": "Check Generate Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Generate Result": {
+      "main": [
+        [
+          {
+            "node": "Accepted (Generate)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare WP Post": {
+      "main": [
+        [
+          {
+            "node": "Has Featured Image?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Featured Image?": {
+      "main": [
+        [
+          {
+            "node": "Download Image",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge Post Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Image": {
+      "main": [
+        [
+          {
+            "node": "WP Media New",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WP Media New": {
+      "main": [
+        [
+          {
+            "node": "Merge Post Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Post Fields": {
+      "main": [
+        [
+          {
+            "node": "WP Create Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WP Create Post": {
+      "main": [
+        [
+          {
+            "node": "Publish Callback (OK)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Publish Callback (Failed)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish Callback (OK)": {
+      "main": [
+        [
+          {
+            "node": "Accepted (WordPress)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish Callback (Failed)": {
+      "main": [
+        [
+          {
+            "node": "Accepted (WP Failed)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Targets": {
+      "main": [
+        [
+          {
+            "node": "Channel Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Channel Router": {
+      "main": [
+        [
+          {
+            "node": "Telegram Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Bale Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Rubika Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WhatsApp Send (Cloud API)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unsupported Channel Ack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Send": {
+      "main": [
+        [
+          {
+            "node": "Telegram Ack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram ErrAck",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bale Send": {
+      "main": [
+        [
+          {
+            "node": "Bale Ack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Bale ErrAck",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rubika Send": {
+      "main": [
+        [
+          {
+            "node": "Rubika Ack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Rubika ErrAck",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp Send (Cloud API)": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp Ack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WhatsApp ErrAck",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Ack": {
+      "main": [
+        [
+          {
+            "node": "Notify Ack (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram ErrAck": {
+      "main": [
+        [
+          {
+            "node": "Notify Ack (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bale Ack": {
+      "main": [
+        [
+          {
+            "node": "Notify Ack (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bale ErrAck": {
+      "main": [
+        [
+          {
+            "node": "Notify Ack (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rubika Ack": {
+      "main": [
+        [
+          {
+            "node": "Notify Ack (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rubika ErrAck": {
+      "main": [
+        [
+          {
+            "node": "Notify Ack (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp Ack": {
+      "main": [
+        [
+          {
+            "node": "Notify Ack (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp ErrAck": {
+      "main": [
+        [
+          {
+            "node": "Notify Ack (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unsupported Channel Ack": {
+      "main": [
+        [
+          {
+            "node": "Notify Ack (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Ack (API)": {
+      "main": [
+        [
+          {
+            "node": "Accepted (Notify)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -1,259 +1,157 @@
-# راهنمای n8n — Publish Pipeline
+# راهنمای Product Pipeline — WooCommerce → وبلاگ وردپرس → تلگرام/بله/روبیکا/واتساپ
 
-این سند قرارداد بین Backend و n8n را برای اولین Vertical Slice توضیح می‌دهد.
+این سند قرارداد端到 سرتِ Automation «محصول جدید» را توضیح می‌دهد: وقتی در WooCommerce محصولی ساخته
+می‌شود، سیستم یک پست وبلاگ فارسی تولید می‌کند، آن را در وردپرس منتشر می‌کند و پیام معرفی محصول را
+روی همه کانال‌های فعال (Telegram، Bale، Rubika، WhatsApp) فانت‌اوت می‌کند.
 
 ## اصل معماری
 
-n8n **System of Record نیست**. n8n فقط Orchestrator است.
-
 ```text
-PostgreSQL = حقیقت Business State
-FastAPI    = Business Rules + API Contract
-n8n        = Integration / Orchestration Runtime
-Provider   = Telegram / Instagram / LinkedIn / ...
+WooCommerce Webhook  ->  FastAPI (ingest + snapshot + job)
+FastAPI Outbox       ->  Outbox Worker               (at-least-once, retry/backoff/DLQ)
+Outbox Worker        ->  n8n Workflow (risheh-product)
+n8n                  ->  WordPress REST / Bot APIs
+n8n                  ->  FastAPI Callbacks (publish-callback / notify-ack)
+PostgreSQL           =  حقیقت کامل Business State؛ n8n فقط Orchestrator است
 ```
 
-Workflow نباید مستقیم به جدول‌های Business بنویسد.
+هیچ Secret داخل فایل JSON workflow ذخیره نشده است. همه کلیدها از `$env` ن8n خوانده می‌شوند.
 
-## ورودی Workflow
+## فایل‌ها
 
-n8n رویدادهای Pending را از Endpoint زیر می‌گیرد:
+| فایل | نقش |
+|---|---|
+| `workflows/product_pipeline_v1.json` | Workflow قابل Import در n8n |
+| `workflows/gen_product_pipeline.py` | اسکریپت تولید مجدد JSON (Source of Truth برای تغییرات) |
+
+Workflow را دستی در n8n ویرایش نکنید؛ تغییرات را در `gen_product_pipeline.py` بدهید و دوباره تولید کنید.
+
+## رویدادها (Outbox → n8n)
+
+همه رویدادها با `POST /webhook/risheh-product` و هدر `x-automation-secret` (مقدار
+`N8N_WEBHOOK_SECRET` بک‌اند) وارد می‌شوند. بدنه توسط `app/outbox_worker.py` ارسال می‌شود:
+
+```json
+{ "event_id": "...", "event_type": "product.*", "workspace_id": "...", "payload": { ... } }
+```
+
+| event_type | زمان ایجاد | payload کلیدی | شاخه Workflow |
+|---|---|---|---|
+| `product.content.generate.requested` | Webhook ورودی محصول جدید | `job_id`, `content_id`, `snapshot_id`, `workspace_id` | Generate Draft (API) |
+| `product.wordpress.publish.requested` | Publish job (auto یا review) | `publication_id`, `title`, `body_markdown`, `excerpt`, `image`, `idempotency_key` | WP Create Post |
+| `product.notify.fanout.requested` | موفق‌شدن انتشار وردپرس | `notification_id`, `message`, `links`, `targets[]` | Channel Router |
+
+## سه شاخه Workflow
+
+### ۱. تولید پیش‌نویس (Generate)
+`Generate Draft (API)` صدا می‌زند:
 
 ```http
-GET /api/v1/automation/outbox?limit=20
-X-Automation-Secret: <N8N_WEBHOOK_SECRET>
+POST /api/v1/workspaces/{workspace_id}/products/jobs/{job_id}/generate-draft
+x-automation-secret: <N8N_WEBHOOK_SECRET>
+{ "instruction": "..." }
 ```
 
-در Docker Network:
+داخل API انجام می‌شود (نه در n8n): فراخوانی AI با grounding روی snapshot محصول، اعتبارسنجی
+قطعی (validate_draft)، چرخه بازنگری خودکار تا `product_max_revisions` و در حالت
+`PRODUCT_AUTO_PUBLISH=true` انتشار خودکار. اگر AI خطا دهد، Job در دیتابیس به `failed` می‌رود و
+Callback لازم نیست.
 
-```text
-http://api:8000/api/v1/automation/outbox
-```
+### ۲. انتشار وردپرس (WordPress)
+1. `Prepare WP Post`: تبدیل Markdown به HTML ساده.
+2. در صورت وجود تصویر: دانلود + آپلود در `wp/v2/media` و ست‌کردن `featured_media`.
+3. ساخت پست با `POST {WORDPRESS_SITE_URL}/wp-json/wp/v2/posts` (Credential نوع WordPress API در n8n).
+4. Callback همیشه اجرا می‌شود:
+   - موفق → `POST /api/v1/automation/products/publish-callback` با `status:"published"` و `external_url`.
+   - ناموفق → همان Endpoint با `status:"failed"` و `error_code:"wp_publish_failed"`.
 
-نمونه Event:
+Callback باعث fan-out اعلان‌ها می‌شود (ایجاد Notification + Deliveryها + رویداد `product.notify.fanout.requested`).
 
-```json
-{
-  "id": "event-uuid",
-  "workspace_id": "workspace-uuid",
-  "event_type": "content.publish.requested",
-  "aggregate_type": "publication",
-  "aggregate_id": "publication-uuid",
-  "idempotency_key": "outbox:publish-key",
-  "payload_json": "{...}"
-}
-```
+### ۳. فانت‌اوت کانال‌ها (Notify)
+`Split Targets` آیتم‌های `targets[]` را جدا و `Channel Router` بر اساس `channel` مسیر می‌کند:
 
-`payload_json` باید Parse شود و شامل این Context است:
+| channel | Adapter | Secret env (n8n) | target_ref |
+|---|---|---|---|
+| `telegram` | `https://api.telegram.org/bot<token>/sendMessage` | `TELEGRAM_BOT_TOKEN` | chat id / @channel |
+| `ble` (بله) | `https://tapi.bale.ai/bot<token>/sendMessage` | `BALE_BOT_TOKEN` | chat id / @channel |
+| `rubika` | `https://bot.rubika.ir:555/v2/sendText` | `RUBIKA_BOT_TOKEN` | chat_id روبیکا |
+| `whatsapp` | Meta Cloud API `graph.facebook.com/v20.0/<phone_id>/messages` | `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` | شماره E.164 |
 
-```json
-{
-  "event_type": "content.publish.requested",
-  "workspace_id": "...",
-  "publication_id": "...",
-  "content_id": "...",
-  "platform": "telegram",
-  "text": "...",
-  "idempotency_key": "..."
-}
-```
-
-## Workflow پیشنهادی
-
-```text
-Schedule Trigger
-      ↓
-GET Pending Outbox
-      ↓
-Loop Over Events
-      ↓
-Parse payload_json
-      ↓
-Switch(platform)
- ┌────┼────────────┐
-Telegram Instagram LinkedIn
-   ↓       ↓          ↓
-Adapter  Adapter     Adapter
- └────┬───────────────┘
-      ↓
-POST Publication Callback
-      ↓
-ACK Outbox
-```
-
-## ترتیب صحیح Callback و ACK
-
-### موفق
-
-1. Provider درخواست انتشار را قبول می‌کند.
-2. n8n `POST /publications/callback` با `published` می‌فرستد.
-3. Backend وضعیت Publication و Content را Update می‌کند.
-4. فقط بعد از موفقیت callback، Outbox با `delivered=true` ACK می‌شود.
-
-### شکست Provider
-
-1. Provider خطا می‌دهد.
-2. n8n callback با `failed`, `error_code`, `error_message` می‌فرستد.
-3. Backend Content را `failed` می‌کند.
-4. Outbox می‌تواند delivered شود چون Event پردازش شده و نتیجه Business ثبت شده است.
-
-### شکست موقت شبکه قبل از ثبت نتیجه
-
-Outbox را ACK نکنید. Event باید برای Retry باقی بماند.
-
-## Callback
+هر ارسال (موفق یا خطا) یک Ack به این Endpoint می‌فرستد:
 
 ```http
-POST /api/v1/publications/callback
-X-Automation-Secret: <N8N_WEBHOOK_SECRET>
-Content-Type: application/json
+POST /api/v1/automation/products/notify-ack
+x-automation-secret: <N8N_WEBHOOK_SECRET>
+{ "notification_id": "...", "idempotency_key": "...", "channel": "telegram",
+  "target_ref": "...", "delivered": true, "external_message_id": "123" }
 ```
 
-موفق:
+وضعیت هر Delivery و جمع کل Notification (`pending/sent/failed`) در PostgreSQL نگهداری می‌شود.
+کانال ناشناخته با `error_code:"channel_not_supported"` Ack می‌شود تا هیچ Delivery معلق نماند.
 
-```json
-{
-  "publication_id": "uuid",
-  "idempotency_key": "publish-key",
-  "status": "published",
-  "external_id": "provider-id",
-  "external_url": "https://...",
-  "error_code": null,
-  "error_message": null
-}
+## راه‌اندازی (راه جدید)
+
+1. **بک‌اند** —环境变量 (env) مربوطه:
+   ```env
+   WOOCOMMERCE_WEBHOOK_SECRET=<حداقل ۱۶ کاراکتر تصادفی>
+   N8N_WEBHOOK_SECRET=<حداقل ۳۲ کاراکتر تصادفی>
+   N8N_PRODUCT_WEBHOOK_URL=http://n8n:5678/webhook/risheh-product
+   PRODUCT_AUTO_PUBLISH=true        # یا false برای Review انسانی
+   AI_API_BASE_URL / AI_API_KEY / AI_MODEL
+   ```
+2. **اعلان کانال‌ها** — برای هر Workspace:
+   ```http
+   POST /api/v1/workspaces/{ws}/notification-channels
+   { "channel": "telegram", "target_ref": "-1001234567890", "display_name": "کانال فروش" }
+   ```
+   (به همین ترتیب `ble`, `rubika`, `whatsapp`)
+3. **n8n**:
+   - Import `workflows/product_pipeline_v1.json` و Active کردن Workflow.
+   - Credentials: یک «WordPress API» Credential با username + Application Password.
+   - Environment Variables n8n: `RISHEH_API_BASE_URL` (مثلاً `http://api:8000`)،
+     `RISHEH_AUTOMATION_SECRET` (= `N8N_WEBHOOK_SECRET`)، توکن‌های چهار کانال بالا،
+     `WORDPRESS_SITE_URL` و اختیاری: `RISHEH_WP_POST_STATUS` (`publish|draft`)،
+     `WHATSAPP_GRAPH_BASE_URL`.
+4. **WooCommerce** (در پیشخوان وردپرس):
+   Settings → Advanced → Webhooks → Add webhook:
+   - Topic: `Product created`
+   - Delivery URL: `https://<api-host>/api/v1/integrations/woocommerce/webhooks/<workspace_id>`
+   - Secret: همان `WOOCOMMERCE_WEBHOOK_SECRET`
+   - Status: Active (API version: V3)
+
+احراز هویت Webhook دو لایه است: هدر `X-Webhook-Secret` یا امضای استاندارد
+`X-WC-Webhook-Signature` (HMAC-SHA256 که WooCommerce با Secret روی بدنه می‌زند).
+
+## Idempotency و Retry
+
+- Webhook تکراری WooCommerce → همان Snapshot (hash محتوایی) و Job موجود؛ رویداد جدید نمی‌سازد.
+- هر Event Outbox با `FOR UPDATE SKIP LOCKED` حداکثر یک‌بار claim می‌شود؛ backoff نما‌یی و DLQ دارد.
+- Callbackها با `idempotency_key` کار می‌کنند؛ تکرار Ack وضعیت را خراب نمی‌کند.
+- اگر n8n Down باشد، رویدادها در جدول outbox می‌مانند و بعداً deliver می‌شوند.
+
+## عیب‌یابی
+
+| نشانه | علت احتمالی | کار |
+|---|---|---|
+| Job در `queued` مانده | Outbox Worker خاموش / webhook آدرس اشتباه | `docker compose logs outbox-worker`، بررسی `N8N_PRODUCT_WEBHOOK_URL` |
+| Job `failed` با `ai_unavailable` | تنظیمات AI | `AI_API_*` را بررسی کنید؛ سپس generate-draft را دستی retry کنید |
+| Job `needs_attention` | رد شدن Draft بعد از سقف بازنگری | نسخه‌ها و `validation_report` را ببینید، با instruction اصلاحی دوباره generate کنید |
+| Publication `failed` با `wp_publish_failed` | Credential/URL وردپرس | Application Password و `WORDPRESS_SITE_URL` را چک کنید |
+| Deliveryها `pending` | Ack نرسیده | لاگ n8n execution؛ مغایرت `notification_id/idempotency_key` |
+| `401 Invalid automation secret` | عدم تطابق secret | `RISHEH_AUTOMATION_SECRET` == `N8N_WEBHOOK_SECRET` |
+
+## تست End-to-End بدون WooCommerce
+
+```bash
+curl -X POST "$API/api/v1/integrations/woocommerce/webhooks/$WORKSPACE_ID" \
+  -H "Content-Type: application/json" -H "X-Webhook-Secret: $WOOCOMMERCE_WEBHOOK_SECRET" \
+  -d '{"id": 999, "name": "عسل کوهی", "description": "<p>عسل طبیعی...</p>", "price": "450000",
+       "permalink": "https://shop.example/product/asal", "images":[{"src":"https://cdn.example/asal.jpg"}]}'
 ```
 
-ناموفق:
+سپس وضعیت Job را ببینید:
 
-```json
-{
-  "publication_id": "uuid",
-  "idempotency_key": "publish-key",
-  "status": "failed",
-  "external_id": null,
-  "external_url": null,
-  "error_code": "RATE_LIMITED",
-  "error_message": "Provider rejected the request"
-}
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "$API/api/v1/workspaces/$WORKSPACE_ID/products/jobs?status_filter=completed"
 ```
-
-## ACK
-
-```http
-POST /api/v1/automation/outbox/ack
-X-Automation-Secret: <N8N_WEBHOOK_SECRET>
-Content-Type: application/json
-```
-
-```json
-{
-  "event_id": "uuid",
-  "delivered": true,
-  "error_message": null
-}
-```
-
-## Idempotency
-
-سه سطح Idempotency داریم:
-
-1. UI/API Command: `PublishRequest.idempotency_key`
-2. Publication: Unique constraint روی همان key
-3. Outbox: `outbox:<publish-key>`
-
-Provider Adapter هم در صورت پشتیبانی Provider باید idempotency را رعایت کند.
-
-## Credential Rule
-
-ممنوع:
-
-```text
-Token داخل Workflow JSON
-Secret داخل GitHub
-Credential داخل Set Node
-```
-
-مجاز:
-
-- n8n Credentials
-- Environment Secret
-- Secret Manager در محیط Production
-
-## Provider Adapter Contract
-
-هر Adapter باید فقط این Interface منطقی را پیاده کند:
-
-```text
-publish(platform_context) ->
-  success(external_id, external_url)
-  OR
-  failure(error_code, error_message, retryable)
-```
-
-Business Rule نباید داخل Adapter باشد.
-
-مثلاً Adapter حق ندارد خودش تصمیم بگیرد Content بدون Approval منتشر شود؛ چون اصلاً Event انتشار برای محتوای تأییدنشده از Backend تولید نمی‌شود.
-
-## Retry Policy پیشنهادی
-
-### Retryable
-
-- HTTP 429
-- Timeout
-- HTTP 502/503/504
-- Temporary network error
-
-### Non-retryable
-
-- Invalid credential
-- Permission denied
-- Invalid media format
-- Deleted destination
-- Policy rejection
-
-برای Retryهای واقعی در فاز Worker، Backoff به شکل تقریبی زیر پیشنهاد می‌شود:
-
-```text
-1m → 5m → 15m → 1h → Dead Letter / Human Review
-```
-
-## Observability
-
-هر Execution باید حداقل این Context را در Log داشته باشد:
-
-```text
-workspace_id
-content_id
-publication_id
-event_id
-idempotency_key
-platform
-provider_result
-execution_id
-```
-
-هیچ Token یا Secret نباید Log شود.
-
-## Naming Convention
-
-```text
-RE-PUB-001 | Outbox Dispatcher
-RE-PUB-010 | Telegram Adapter
-RE-PUB-020 | Instagram Adapter
-RE-PUB-030 | LinkedIn Adapter
-RE-ERR-001 | Automation Failure Handler
-```
-
-## Definition of Done برای اولین Adapter واقعی
-
-- Credential خارج از Workflow است.
-- Provider Sandbox/Test destination استفاده شده.
-- Success callback تست شده.
-- Failure callback تست شده.
-- 429/timeout behavior مشخص است.
-- Duplicate Event باعث Duplicate Post نمی‌شود یا limitation Provider مستند شده است.
-- Logها Secret ندارند.
-- اجرای Workflow قابل ردیابی با `publication_id` است.
-- Runbook خطا نوشته شده است.
-
-تا قبل از این Gate، Adapter نباید برای مشتری Production فعال شود.

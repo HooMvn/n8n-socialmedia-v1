@@ -63,6 +63,30 @@ async def get_current_user(
     return user
 
 
+async def get_optional_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    session: AsyncSession = Depends(get_session),
+) -> User | None:
+    """Like get_current_user but returns None instead of raising when no/invalid token."""
+    if credentials is None:
+        return None
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            settings.app_secret_key,
+            algorithms=["HS256"],
+            audience=settings.jwt_audience,
+            issuer=settings.jwt_issuer,
+        )
+        user_id = uuid.UUID(payload["sub"])
+    except (jwt.PyJWTError, KeyError, ValueError):
+        return None
+    user = await session.get(User, user_id)
+    if not user or not user.is_active:
+        return None
+    return user
+
+
 async def require_workspace_member(
     workspace_id: uuid.UUID,
     current_user: User = Depends(get_current_user),

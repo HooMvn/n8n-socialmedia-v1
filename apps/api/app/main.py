@@ -7,6 +7,7 @@ from app.database import database_is_ready
 from app.engagement_routes import router as engagement_router
 from app.hardening_routes import router as hardening_router
 from app.observability import metrics_response, observability_middleware
+from app.product_routes import router as product_router
 from app.routes import router
 from app.settings import settings
 
@@ -29,6 +30,7 @@ app.include_router(router)
 app.include_router(communication_router)
 app.include_router(engagement_router)
 app.include_router(hardening_router)
+app.include_router(product_router)
 
 
 @app.get("/health", tags=["system"])

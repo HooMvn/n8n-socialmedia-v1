@@ -1,0 +1,192 @@
+"""Product pipeline (WooCommerce snapshots, content jobs) and multi-channel notifications.
+
+Revision ID: 0006_product_pipeline
+Revises: 0005_grounded_ai
+"""
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+revision: str = "0006_product_pipeline"
+down_revision: str | None = "0005_grounded_ai"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+product_job_status = postgresql.ENUM(
+    "queued", "generating", "validating", "quality_review", "revising",
+    "ready_for_review", "needs_attention", "completed", "failed", "cancelled",
+    name="product_job_status", create_type=False,
+)
+notify_status = postgresql.ENUM(
+    "pending", "sent", "failed", "skipped", name="notify_status", create_type=False,
+)
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+    product_job_status.create(bind, checkfirst=True)
+    notify_status.create(bind, checkfirst=True)
+
+    # Prerequisite for workspace-scoped composite FKs below (models declare these
+    # constraints; earlier migrations created the tables without them).
+    op.create_unique_constraint(
+        "uq_provider_credential_workspace_id", "provider_credentials", ["workspace_id", "id"]
+    )
+    op.create_unique_constraint(
+        "uq_content_items_workspace_id", "content_items", ["workspace_id", "id"]
+    )
+
+    # --- Product snapshot & content job -------------------------------------
+    op.create_table(
+        "product_snapshots",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("workspace_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("credential_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("external_product_id", sa.String(64), nullable=False),
+        sa.Column("source_hash", sa.String(64), nullable=False),
+        sa.Column("schema_version", sa.Integer(), nullable=False, server_default="1"),
+        sa.Column("data", postgresql.JSONB(), nullable=False),
+        sa.Column("fetched_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.UniqueConstraint("workspace_id", "credential_id", "external_product_id", "source_hash", name="uq_product_snapshot_source"),
+        sa.UniqueConstraint("workspace_id", "id", name="uq_product_snapshot_workspace_id"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "credential_id"],
+            ["provider_credentials.workspace_id", "provider_credentials.id"],
+            name="fk_product_snapshot_workspace_credential",
+        ),
+        sa.CheckConstraint("char_length(source_hash) = 64", name="ck_product_snapshot_hash_len"),
+        sa.CheckConstraint("char_length(external_product_id) >= 1", name="ck_product_snapshot_external_id"),
+    )
+    op.create_index("ix_product_snapshots_workspace_id", "product_snapshots", ["workspace_id"])
+    op.create_index("ix_product_snapshots_credential_id", "product_snapshots", ["credential_id"])
+
+    op.create_table(
+        "product_content_jobs",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("workspace_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("snapshot_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("content_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("status", product_job_status, nullable=False, server_default="queued"),
+        sa.Column("revision_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("max_revisions", sa.Integer(), nullable=False, server_default="2"),
+        sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("idempotency_key", sa.String(180), nullable=False),
+        sa.Column("created_by_user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
+        sa.Column("error_code", sa.String(120), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.UniqueConstraint("workspace_id", "idempotency_key", name="uq_product_job_workspace_idempotency"),
+        sa.UniqueConstraint("content_id", name="uq_product_job_content"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "snapshot_id"],
+            ["product_snapshots.workspace_id", "product_snapshots.id"],
+            name="fk_product_job_workspace_snapshot",
+        ),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "content_id"],
+            ["content_items.workspace_id", "content_items.id"],
+            name="fk_product_job_workspace_content",
+            ondelete="CASCADE",
+        ),
+        sa.CheckConstraint("max_revisions >= 0 AND max_revisions <= 5", name="ck_product_job_max_revisions"),
+        sa.CheckConstraint("revision_count >= 0 AND revision_count <= max_revisions", name="ck_product_job_revision_count"),
+        sa.CheckConstraint("attempts >= 0", name="ck_product_job_attempts"),
+    )
+    op.create_index("ix_product_content_jobs_workspace_id", "product_content_jobs", ["workspace_id"])
+    op.create_index("ix_product_content_jobs_snapshot_id", "product_content_jobs", ["snapshot_id"])
+    op.create_index("ix_product_content_jobs_status", "product_content_jobs", ["status"])
+
+    # --- Multi-channel notification fan-out ---------------------------------
+    op.create_table(
+        "notification_channels",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("workspace_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("channel", sa.String(40), nullable=False),
+        sa.Column("target_ref", sa.String(255), nullable=False),
+        sa.Column("display_name", sa.String(120), nullable=False, server_default=""),
+        sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.true()),
+        sa.Column("credential_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("template_key", sa.String(60), nullable=False, server_default="product_default"),
+        sa.Column("extra_json", postgresql.JSONB(), nullable=False, server_default="{}"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.UniqueConstraint("workspace_id", "channel", "target_ref", name="uq_notification_channel_target"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "credential_id"],
+            ["provider_credentials.workspace_id", "provider_credentials.id"],
+            name="fk_notification_channel_workspace_credential",
+        ),
+        sa.CheckConstraint("char_length(channel) BETWEEN 2 AND 40", name="ck_notification_channel_name"),
+    )
+    op.create_index("ix_notification_channels_workspace_id", "notification_channels", ["workspace_id"])
+    op.create_index("ix_notification_channels_channel", "notification_channels", ["channel"])
+
+    op.create_table(
+        "product_notifications",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("workspace_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("content_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("job_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("product_content_jobs.id", ondelete="SET NULL"), nullable=True),
+        sa.Column("message", sa.Text(), nullable=False),
+        sa.Column("links_json", postgresql.JSONB(), nullable=False, server_default="{}"),
+        sa.Column("idempotency_key", sa.String(180), nullable=False),
+        sa.Column("status", notify_status, nullable=False, server_default="pending"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.UniqueConstraint("workspace_id", "idempotency_key", name="uq_product_notification_idempotency"),
+        sa.UniqueConstraint("workspace_id", "id", name="uq_product_notification_workspace_id"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "content_id"],
+            ["content_items.workspace_id", "content_items.id"],
+            name="fk_product_notification_workspace_content",
+            ondelete="CASCADE",
+        ),
+    )
+    op.create_index("ix_product_notifications_workspace_id", "product_notifications", ["workspace_id"])
+    op.create_index("ix_product_notifications_content_id", "product_notifications", ["content_id"])
+    op.create_index("ix_product_notifications_job_id", "product_notifications", ["job_id"])
+    op.create_index("ix_product_notifications_status", "product_notifications", ["status"])
+
+    op.create_table(
+        "product_notification_deliveries",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("notification_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("product_notifications.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("channel", sa.String(40), nullable=False),
+        sa.Column("target_ref", sa.String(255), nullable=False),
+        sa.Column("status", notify_status, nullable=False, server_default="pending"),
+        sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("external_message_id", sa.String(255), nullable=True),
+        sa.Column("error_code", sa.String(120), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column("delivered_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.UniqueConstraint("notification_id", "channel", "target_ref", name="uq_notification_delivery_target"),
+        sa.ForeignKeyConstraint(
+            ["notification_id", "workspace_id"],
+            ["product_notifications.id", "product_notifications.workspace_id"],
+            name="fk_delivery_workspace_consistency",
+            ondelete="CASCADE",
+        ),
+    )
+    op.create_index("ix_product_notification_deliveries_workspace_id", "product_notification_deliveries", ["workspace_id"])
+    op.create_index("ix_product_notification_deliveries_notification_id", "product_notification_deliveries", ["notification_id"])
+    op.create_index("ix_product_notification_deliveries_status", "product_notification_deliveries", ["status"])
+
+
+def downgrade() -> None:
+    for table in [
+        "product_notification_deliveries", "product_notifications", "notification_channels",
+        "product_content_jobs", "product_snapshots",
+    ]:
+        op.drop_table(table)
+    op.drop_constraint("uq_content_items_workspace_id", "content_items", type_="unique")
+    op.drop_constraint("uq_provider_credential_workspace_id", "provider_credentials", type_="unique")
+    bind = op.get_bind()
+    notify_status.drop(bind, checkfirst=True)
+    product_job_status.drop(bind, checkfirst=True)

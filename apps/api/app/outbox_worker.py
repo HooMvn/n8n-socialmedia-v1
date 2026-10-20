@@ -22,6 +22,8 @@ def backoff_seconds(attempt: int) -> int:
 def webhook_for_event(event_type: str) -> str:
     if event_type == "message.outbound.requested":
         return settings.n8n_outbound_webhook_url
+    if event_type.startswith("product.") and settings.n8n_product_webhook_url:
+        return settings.n8n_product_webhook_url
     return settings.n8n_publish_webhook_url
 
 

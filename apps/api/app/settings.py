@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_default_chat_id: str = ""
 
+    # WooCommerce -> Blog -> Notify product pipeline
+    woocommerce_webhook_secret: str = "change-me"
+    product_auto_publish: bool = True
+    product_max_revisions: int = 2
+    product_job_max_attempts: int = 5
+    n8n_product_webhook_url: str = "http://n8n:5678/webhook/risheh-product"
+
     ai_provider: str = "openai-compatible"
     ai_api_base_url: str = ""
     ai_api_key: str = ""
@@ -49,6 +56,8 @@ class Settings(BaseSettings):
             raise ValueError("APP_SECRET_KEY must be a strong production secret")
         if self.n8n_webhook_secret in unsafe or len(self.n8n_webhook_secret) < 32:
             raise ValueError("N8N_WEBHOOK_SECRET must be a strong production secret")
+        if self.woocommerce_webhook_secret in unsafe or len(self.woocommerce_webhook_secret) < 16:
+            raise ValueError("WOOCOMMERCE_WEBHOOK_SECRET must be a strong shared secret")
         if "localhost" in self.cors_origins or "*" in self.cors_origins:
             raise ValueError("CORS_ORIGINS must be explicit production origins")
         if "@db:" in self.database_url or "engage:engage" in self.database_url:

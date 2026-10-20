@@ -4,7 +4,16 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -101,7 +110,12 @@ class SLATracker(Base, TimestampMixin):
 
 class ProviderCredential(Base, TimestampMixin):
     __tablename__ = "provider_credentials"
-    __table_args__ = (UniqueConstraint("workspace_id", "provider", "credential_name", name="uq_provider_credential_workspace"),)
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "provider", "credential_name", name="uq_provider_credential_workspace"),
+        # Composite key so downstream tables (product snapshots, notification channels)
+        # can declare workspace-scoped FKs that prevent cross-tenant references.
+        UniqueConstraint("workspace_id", "id", name="uq_provider_credential_workspace_id"),
+    )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
     provider: Mapped[str] = mapped_column(String(40), nullable=False, index=True)

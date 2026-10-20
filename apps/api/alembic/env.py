@@ -8,6 +8,7 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app import communication_domain, engagement_domain, hardening_domain  # noqa: F401
+from app import notify_domain, product_domain  # noqa: F401
 from app.domain import Base
 from app.settings import settings
 
